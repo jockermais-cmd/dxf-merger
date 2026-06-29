@@ -400,10 +400,13 @@ class DXFMergerApp:
                     font=('Segoe UI', 9), padding=(6, 4), relief='flat')
         s.map('Small.TButton', background=[('active', COLORS['border'])])
 
-        s.configure('Merge.TProgressbar',
-                    troughcolor=COLORS['border_light'],
-                    background=COLORS['accent'],
-                    thickness=8)
+        try:
+            s.configure('TProgressbar',
+                        troughcolor=COLORS['border_light'],
+                        background=COLORS['accent'],
+                        thickness=8)
+        except Exception:
+            pass
 
     # ── Layout principal ────────────────────────────────────────────────────
 
@@ -550,7 +553,7 @@ class DXFMergerApp:
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             action, variable=self.progress_var,
-            maximum=100, style='Merge.TProgressbar'
+            maximum=100
         )
         self.progress_bar.pack(fill='x', pady=(0, 6))
 
