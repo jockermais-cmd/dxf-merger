@@ -1,10 +1,11 @@
 """
-DXF Merger v1.1
+DXF Merger v1.4
 Unificador de pranchas DXF exportadas do Revit.
 
 Correção estrutural:
-- usa ezdxf para recriar handles e vínculos internos válidos;
-- importa blocos e recursos usados pelas entidades;
+- usa o carregador XREF moderno do ezdxf para recriar handles e vínculos;
+- preserva o vínculo do layout com sua viewport principal (grupo DXF 331);
+- isola recursos conflitantes entre diferentes exportações do Revit;
 - cria uma aba de layout para cada prancha de entrada;
 - ajusta as viewports para os modelos deslocados;
 - valida o arquivo final antes de concluir.
@@ -38,8 +39,7 @@ def _load_ezdxf():
     """Carrega ezdxf apenas quando o merge é iniciado, preservando a abertura da UI."""
     try:
         import ezdxf
-        from ezdxf import bbox, recover, transform
-        from ezdxf.addons import Importer
+        from ezdxf import bbox, recover, transform, xref
         from ezdxf.lldxf.const import DXFStructureError
         from ezdxf.math import Matrix44, Vec3
     except ImportError as exc:
@@ -48,7 +48,7 @@ def _load_ezdxf():
             "Abra o Prompt de Comando e execute:\n"
             "py -m pip install ezdxf"
         ) from exc
-    return ezdxf, bbox, recover, transform, Importer, DXFStructureError, Matrix44, Vec3
+    return ezdxf, bbox, recover, transform, xref, DXFStructureError, Matrix44, Vec3
 
 
 _INVALID_LAYOUT_CHARS = re.compile(r'[<>/\\":;?*|=]')
@@ -118,54 +118,34 @@ def _model_extents(doc, bbox):
     return 0.0, 0.0, 1.0, 1.0
 
 
-def _shift_layout_viewports(layout, ox, oy, Vec3):
+
+def _set_layout_main_viewport(layout):
     """
-    Mantém a mesma vista depois que o conteúdo do modelspace é transladado.
+    Garante que o objeto LAYOUT aponte para a viewport principal do paperspace.
 
-    O centro da viewport no papel não é alterado. Somente os pontos da vista
-    no modelspace são deslocados.
+    O vínculo é gravado no grupo DXF 331. Sem esse vínculo o AutoCAD pode
+    ativar uma viewport de modelo ao abrir a aba, fazendo a folha aparecer
+    minúscula enquanto o conteúdo de uma viewport ocupa a tela inteira.
     """
-    shifted = 0
-    for viewport in layout.query("VIEWPORT"):
-        try:
-            viewport_id = int(viewport.dxf.get("id", 2))
-        except (TypeError, ValueError):
-            viewport_id = 2
-
-        # ID 1 é a viewport geral do próprio paperspace.
-        if viewport_id <= 1:
-            continue
-
-        if viewport.dxf.hasattr("view_center_point"):
-            center = Vec3(viewport.dxf.view_center_point)
-            viewport.dxf.view_center_point = (center.x + ox, center.y + oy)
-
-        if viewport.dxf.hasattr("view_target_point"):
-            target = Vec3(viewport.dxf.view_target_point)
-            viewport.dxf.view_target_point = target + Vec3(ox, oy, 0.0)
-
-        shifted += 1
-    return shifted
+    main_viewport = layout.main_viewport()
+    if main_viewport is None:
+        main_viewport = layout.add_new_main_viewport()
+    layout.set_current_viewport_handle(main_viewport.dxf.handle)
+    return main_viewport
 
 
 def merge_dxf_files(input_files, output_path, progress_callback=None):
     """
-    Mescla múltiplos DXFs em um documento estruturalmente válido.
-
-    Estratégia:
-      1. cada modelspace é importado por uma biblioteca DXF, que recria handles,
-         proprietários, tabelas, blocos e referências;
-      2. os modelos são distribuídos horizontalmente, sem sobreposição;
-      3. cada paperspace de origem vira uma aba de layout independente;
-      4. as viewports são ajustadas pelo mesmo deslocamento do modelspace;
-      5. o resultado é auditado, salvo de forma atômica e reaberto para validação.
+    Mescla múltiplos DXFs mantendo a fidelidade exata dos layouts e viewports.
+    Em vez de transladar o modelspace (o que quebra o DCS/centralização das viewports do Revit),
+    reunimos os modelos na mesma origem e isolamos as exibições por abas de layout.
     """
     (
         ezdxf,
         bbox,
         recover,
         transform,
-        Importer,
+        xref,
         DXFStructureError,
         Matrix44,
         Vec3,
@@ -209,11 +189,8 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
             "doc": doc,
             "recovered": was_recovered,
             "source_auditor": source_auditor,
-            "bbox": _model_extents(doc, bbox),
         })
 
-    # Usar a versão DXF mais nova entre as entradas. Se houver versão não
-    # reconhecida, R2018 é a opção segura para o AutoCAD atual.
     output_version = max(
         (item["doc"].dxfversion for item in loaded),
         key=lambda version: _VERSION_ORDER.get(version, _VERSION_ORDER["AC1032"]),
@@ -224,60 +201,55 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
     cb(28, "Criando o desenho de destino...")
     target = ezdxf.new(dxfversion=output_version, setup=True)
 
-    # Preservar unidades do primeiro arquivo quando definidas.
     try:
         target.units = loaded[0]["doc"].units
     except Exception:
         pass
 
-    # É obrigatório existir ao menos um paperspace. Mantemos um temporário
-    # até que a primeira folha seja importada.
     temp_layout_name = "__DXF_MERGER_TEMP__"
     if "Layout1" in target.layouts:
         target.layouts.rename("Layout1", temp_layout_name)
 
     target_msp = target.modelspace()
-    x_cursor = 0.0
     imported_layouts = 0
-    imported_model_entities = 0
-    shifted_viewports = 0
-    transform_warnings = []
-
+    
     total = len(loaded)
     for index, item in enumerate(loaded, start=1):
         source = item["doc"]
         filename = os.path.basename(item["path"])
         cb(30 + (index - 1) / total * 52, f"Mesclando {filename}...")
 
-        xmin, ymin, xmax, ymax = item["bbox"]
-        model_width = max(float(xmax - xmin), 1.0)
-        ox = x_cursor - float(xmin)
-        oy = 0.0
+        before_layout_names = set(target.layouts.names())
 
-        importer = Importer(source, target)
-
-        # Importar modelspace e capturar somente as entidades recém-criadas.
-        before_count = len(target_msp)
-        importer.import_modelspace(target_layout=target_msp)
-        imported_now = list(target_msp)[before_count:]
-        imported_model_entities += len(imported_now)
-
-        logger = transform.inplace(
-            imported_now,
-            Matrix44.translate(ox, oy, 0.0),
+        # O ezdxf Loader com NUM_PREFIX cuida de evitar colisões de blocos de mesma origem
+        loader = xref.Loader(
+            source,
+            target,
+            conflict_policy=xref.ConflictPolicy.NUM_PREFIX,
         )
-        if len(logger):
-            transform_warnings.extend(
-                f"{filename}: {message}" for message in logger.messages()
-            )
+        loader.load_modelspace(target_layout=target_msp)
 
         source_paperspaces = [
             layout for layout in source.layouts
             if layout.name.casefold() != "model"
         ]
-
         for source_layout in source_paperspaces:
-            imported_layout = importer.import_paperspace_layout(source_layout.name)
+            loader.load_paperspace_layout(source_layout)
+
+        loader.execute(xref_prefix=f"F{index}")
+
+        # Identifica os layouts criados nesta iteração
+        created_layout_names = [
+            name for name in target.layouts.names()
+            if name not in before_layout_names
+        ]
+
+        for source_layout, created_name in zip(source_paperspaces, created_layout_names):
+            imported_layout = target.layouts.get(created_name)
+
+            # Como o modelo NÃO mudou de lugar, restabelecemos o vínculo principal do viewport
+            # sem realizar transformações ou deslocamentos que quebram a calibração do Revit.
+            _set_layout_main_viewport(imported_layout)
 
             if len(source_paperspaces) == 1:
                 desired_name = item["name"]
@@ -285,22 +257,13 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
                 desired_name = f"{item['name']} - {source_layout.name}"
 
             final_name = _unique_layout_name(target, desired_name)
-            old_name = imported_layout.name
-            if old_name != final_name:
-                target.layouts.rename(old_name, final_name)
+            if created_name != final_name:
+                target.layouts.rename(created_name, final_name)
+                
             imported_layout = target.layouts.get(final_name)
-
-            shifted_viewports += _shift_layout_viewports(
-                imported_layout, ox, oy, Vec3
-            )
+            _set_layout_main_viewport(imported_layout)
             imported_layouts += 1
 
-        # Importa recursos dependentes: blocos, layers, linetypes, estilos e
-        # dimstyles. Também resolve nomes repetidos entre arquivos diferentes.
-        importer.finalize()
-
-        # Gap proporcional, com mínimo de 50 unidades do próprio desenho.
-        x_cursor += model_width + max(model_width * 0.05, 50.0)
         cb(30 + index / total * 52, f"Concluído: {filename}")
 
     if imported_layouts:
@@ -313,12 +276,8 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
     auditor = target.audit()
     if auditor.has_errors:
         details = "; ".join(str(error) for error in auditor.errors[:8])
-        raise RuntimeError(
-            "A auditoria encontrou erros estruturais não corrigidos no DXF final. "
-            + details
-        )
+        raise RuntimeError("A auditoria encontrou erros estruturais no DXF final. " + details)
 
-    # Gravação atômica: o arquivo final só é substituído depois de concluído.
     temp_output = output_path + ".tmp.dxf"
     try:
         cb(91, "Gravando arquivo temporário...")
@@ -328,13 +287,8 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
         validation_doc = ezdxf.readfile(temp_output)
         validation_auditor = validation_doc.audit()
         if validation_auditor.has_errors:
-            details = "; ".join(
-                str(error) for error in validation_auditor.errors[:8]
-            )
-            raise RuntimeError(
-                "O arquivo foi gravado, mas falhou na validação de releitura. "
-                + details
-            )
+            details = "; ".join(str(error) for error in validation_auditor.errors[:8])
+            raise RuntimeError("O arquivo falhou na validação de releitura. " + details)
 
         os.replace(temp_output, output_path)
     finally:
@@ -344,48 +298,14 @@ def merge_dxf_files(input_files, output_path, progress_callback=None):
             except OSError:
                 pass
 
-    cb(100, f"✓ Concluído! {total} arquivo{'s' if total != 1 else ''} mesclado{'s' if total != 1 else ''}.")
-
-    # Informações úteis no console para diagnóstico, sem interromper o usuário.
-    print(
-        "DXF Merger v1.1:",
-        f"arquivos={total},",
-        f"entidades_model={imported_model_entities},",
-        f"layouts={imported_layouts},",
-        f"viewports_ajustadas={shifted_viewports},",
-        f"fontes_recuperadas={recovered_count},",
-        f"avisos_transformacao={len(transform_warnings)}",
-    )
-    for warning in transform_warnings[:20]:
-        print("AVISO:", warning, file=sys.stderr)
-
+    cb(100, f"✓ Concluído! {total} arquivo(s) mesclado(s).")
     return True
-
-
-# ═══════════════════════════════════════════════════════════════
-#  UI — Interface gráfica com tkinter
-# ═══════════════════════════════════════════════════════════════
-
-COLORS = {
-    'bg':           '#F4F3F0',
-    'card':         '#FFFFFF',
-    'accent':       '#185FA5',
-    'accent_dark':  '#0C447C',
-    'text':         '#2C2C2A',
-    'muted':        '#5F5E5A',
-    'border':       '#D3D1C7',
-    'border_light': '#E8E6E0',
-    'success':      '#3B6D11',
-    'error':        '#A32D2D',
-    'list_bg':      '#FAFAF8',
-    'list_sel':     '#185FA5',
-}
 
 
 class DXFMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("DXF Merger v1.1 — Unificador de Pranchas Revit")
+        self.root.title("DXF Merger v1.3 — Unificador de Pranchas Revit")
         self.root.minsize(760, 520)
         self.root.configure(bg=COLORS['bg'])
         self.files = []   # lista de caminhos completos
@@ -426,7 +346,19 @@ class DXFMergerApp:
                     font=('Segoe UI', 9), padding=(6, 4), relief='flat')
         s.map('Small.TButton', background=[('active', COLORS['border'])])
 
-        s.configure('Merge.TProgressbar',
+        # Progressbar possui uma classe orientada no ttk. Em versões recentes
+        # do Tk/Python, usar apenas ``Merge.TProgressbar`` faz o ttk procurar
+        # ``Horizontal.Merge.TProgressbar``, um layout que não existe.
+        # O nome abaixo segue a hierarquia correta e copia explicitamente o
+        # layout padrão para manter compatibilidade com Tk 8.6/8.7.
+        progress_style = 'Merge.Horizontal.TProgressbar'
+        try:
+            base_layout = s.layout('Horizontal.TProgressbar')
+            if base_layout:
+                s.layout(progress_style, base_layout)
+        except tk.TclError:
+            pass
+        s.configure(progress_style,
                     troughcolor=COLORS['border_light'],
                     background=COLORS['accent'],
                     thickness=8)
@@ -576,7 +508,8 @@ class DXFMergerApp:
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             action, variable=self.progress_var,
-            maximum=100, style='Merge.TProgressbar'
+            maximum=100, orient='horizontal',
+            style='Merge.Horizontal.TProgressbar'
         )
         self.progress_bar.pack(fill='x', pady=(0, 6))
 
