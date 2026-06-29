@@ -1,338 +1,364 @@
 """
-DXF Merger v1.0
-Unificador de pranchas DXF exportadas do Revit
+DXF Merger v1.1
+Unificador de pranchas DXF exportadas do Revit.
 
-Uso: python dxf_merger.py
-Requisitos: Python 3.8+ com tkinter (incluso no Python padrão para Windows e macOS)
-Sem dependências externas.
+Correção estrutural:
+- usa ezdxf para recriar handles e vínculos internos válidos;
+- importa blocos e recursos usados pelas entidades;
+- cria uma aba de layout para cada prancha de entrada;
+- ajusta as viewports para os modelos deslocados;
+- valida o arquivo final antes de concluir.
+
+Uso:
+    python dxf_merger_corrigido.py
+
+Requisitos:
+    Python 3.9+
+    pip install ezdxf
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+import re
 import sys
 import threading
 from pathlib import Path
-from collections import Counter
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CORE — Lógica de leitura e merge de DXF (sem dependências)
+#  CORE — Merge estrutural de DXF com ezdxf
 # ═══════════════════════════════════════════════════════════════
 
-def parse_dxf_pairs(filepath):
-    """Lê o DXF e retorna lista de (group_code, value)."""
-    with open(filepath, 'r', encoding='latin-1', errors='replace') as f:
-        lines = [l.rstrip('\r\n') for l in f.readlines()]
-    pairs = []
-    for i in range(0, len(lines) - 1, 2):
-        pairs.append((lines[i].strip(), lines[i + 1].strip()))
-    return pairs
+class MissingDependencyError(RuntimeError):
+    """Biblioteca necessária não instalada."""
 
 
-def extract_sections(pairs):
-    """Extrai seções HEADER, TABLES, ENTITIES do DXF."""
-    sections = {}
-    i = 0
-    while i < len(pairs):
-        if pairs[i] == ('0', 'SECTION') and i + 1 < len(pairs):
-            name = pairs[i + 1][1]
-            start = i + 2
-            j = start
-            while j < len(pairs):
-                if pairs[j] == ('0', 'ENDSEC'):
-                    sections[name] = pairs[start:j]
-                    i = j + 1
-                    break
-                j += 1
-        i += 1
-    return sections
+def _load_ezdxf():
+    """Carrega ezdxf apenas quando o merge é iniciado, preservando a abertura da UI."""
+    try:
+        import ezdxf
+        from ezdxf import bbox, recover, transform
+        from ezdxf.addons import Importer
+        from ezdxf.lldxf.const import DXFStructureError
+        from ezdxf.math import Matrix44, Vec3
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "A biblioteca 'ezdxf' não está instalada.\n\n"
+            "Abra o Prompt de Comando e execute:\n"
+            "py -m pip install ezdxf"
+        ) from exc
+    return ezdxf, bbox, recover, transform, Importer, DXFStructureError, Matrix44, Vec3
 
 
-def get_table_records(tables_pairs, entity_type):
-    """Extrai registros de um tipo de tabela, retornando {nome: pares}."""
-    records = {}
-    i = 0
-    while i < len(tables_pairs):
-        if tables_pairs[i][0] == '0' and tables_pairs[i][1] == entity_type:
-            start = i
-            name = None
-            j = i + 1
-            while j < len(tables_pairs) and tables_pairs[j][0] != '0':
-                if tables_pairs[j][0] == '2':
-                    name = tables_pairs[j][1]
-                j += 1
-            if name and name not in records:
-                records[name] = tables_pairs[start:j]
-            i = j
-        else:
-            i += 1
-    return records
+_INVALID_LAYOUT_CHARS = re.compile(r'[<>/\\":;?*|=]')
+_VERSION_ORDER = {
+    "AC1009": 0,   # R12
+    "AC1012": 1,   # R13
+    "AC1014": 2,   # R14
+    "AC1015": 3,   # R2000
+    "AC1018": 4,   # R2004
+    "AC1021": 5,   # R2007
+    "AC1024": 6,   # R2010
+    "AC1027": 7,   # R2013
+    "AC1032": 8,   # R2018+
+}
 
 
-def split_entities(entities_pairs):
+def _sanitize_layout_name(name):
+    """Gera um nome de layout aceito pelo AutoCAD."""
+    cleaned = _INVALID_LAYOUT_CHARS.sub("_", str(name)).strip().strip(".")
+    if not cleaned or cleaned.casefold() == "model":
+        cleaned = "Folha"
+    return cleaned[:250]
+
+
+def _unique_layout_name(doc, desired):
+    """Retorna nome de layout único, sem diferenciar maiúsculas/minúsculas."""
+    desired = _sanitize_layout_name(desired)
+    existing = {name.casefold() for name in doc.layouts.names()}
+    if desired.casefold() not in existing:
+        return desired
+
+    base = desired[:238]
+    number = 2
+    while True:
+        candidate = f"{base} ({number})"
+        if candidate.casefold() not in existing:
+            return candidate
+        number += 1
+
+
+def _read_dxf(path, ezdxf, recover, DXFStructureError):
+    """Lê normalmente e, se necessário, tenta a rotina de recuperação do ezdxf."""
+    try:
+        return ezdxf.readfile(path), False, None
+    except (OSError, DXFStructureError) as direct_error:
+        try:
+            doc, auditor = recover.readfile(path, errors="surrogateescape")
+            return doc, True, auditor
+        except Exception as recovery_error:
+            raise RuntimeError(
+                f"Não foi possível ler o DXF '{os.path.basename(path)}'.\n"
+                f"Leitura normal: {direct_error}\n"
+                f"Recuperação: {recovery_error}"
+            ) from recovery_error
+
+
+def _model_extents(doc, bbox):
+    """Retorna xmin, ymin, xmax, ymax do modelspace, com fallback seguro."""
+    try:
+        box = bbox.extents(doc.modelspace(), fast=True)
+        if box.has_data:
+            values = (box.extmin.x, box.extmin.y, box.extmax.x, box.extmax.y)
+            if all(float("-inf") < float(v) < float("inf") for v in values):
+                return values
+    except Exception:
+        pass
+    return 0.0, 0.0, 1.0, 1.0
+
+
+def _shift_layout_viewports(layout, ox, oy, Vec3):
     """
-    Separa entidades em modelspace e paperspace.
-    Group code 67 == '1' indica paperspace; ausente ou '0' indica modelspace.
+    Mantém a mesma vista depois que o conteúdo do modelspace é transladado.
+
+    O centro da viewport no papel não é alterado. Somente os pontos da vista
+    no modelspace são deslocados.
     """
-    model_ents, paper_ents = [], []
-    i = 0
-    while i < len(entities_pairs):
-        if entities_pairs[i][0] == '0':
-            start = i
-            j = i + 1
-            space = 'model'
-            while j < len(entities_pairs) and entities_pairs[j][0] != '0':
-                if entities_pairs[j][0] == '67' and entities_pairs[j][1] == '1':
-                    space = 'paper'
-                j += 1
-            ent = entities_pairs[start:j]
-            (model_ents if space == 'model' else paper_ents).append(ent)
-            i = j
-        else:
-            i += 1
-    return model_ents, paper_ents
+    shifted = 0
+    for viewport in layout.query("VIEWPORT"):
+        try:
+            viewport_id = int(viewport.dxf.get("id", 2))
+        except (TypeError, ValueError):
+            viewport_id = 2
 
+        # ID 1 é a viewport geral do próprio paperspace.
+        if viewport_id <= 1:
+            continue
 
-def compute_bbox(ents):
-    """Calcula bounding box das entidades. Retorna (xmin, ymin, xmax, ymax)."""
-    xs, ys = [], []
-    for ent in ents:
-        for c, v in ent:
-            try:
-                if c in ('10', '11', '12', '13', '14', '15', '16'):
-                    xs.append(float(v))
-                elif c in ('20', '21', '22', '23', '24', '25', '26'):
-                    ys.append(float(v))
-            except ValueError:
-                pass
-    if not xs:
-        return (0.0, 0.0, 1.0, 1.0)
-    return (min(xs), min(ys), max(xs), max(ys))
+        if viewport.dxf.hasattr("view_center_point"):
+            center = Vec3(viewport.dxf.view_center_point)
+            viewport.dxf.view_center_point = (center.x + ox, center.y + oy)
 
+        if viewport.dxf.hasattr("view_target_point"):
+            target = Vec3(viewport.dxf.view_target_point)
+            viewport.dxf.view_target_point = target + Vec3(ox, oy, 0.0)
 
-def pairs_to_text(pairs):
-    """Converte lista de pares de volta para texto DXF."""
-    return '\n'.join(f"{c:>3}\n{v}" for c, v in pairs)
-
-
-def translate_entity_x(ent_pairs, ox):
-    """Translada coordenadas X de uma entidade pelo offset ox."""
-    result = []
-    for c, v in ent_pairs:
-        if c in ('10', '11', '12', '13', '14', '15', '16'):
-            try:
-                result.append((c, f"{float(v) + ox:.10g}"))
-            except ValueError:
-                result.append((c, v))
-        else:
-            result.append((c, v))
-    return result
-
-
-def translate_entity_y(ent_pairs, oy, skip_code22=False):
-    """Translada coordenadas Y de uma entidade pelo offset oy."""
-    result = []
-    for c, v in ent_pairs:
-        # code 22 no VIEWPORT é a componente Z do view center, não Y do paper
-        if c in ('20', '21', '23', '24', '25', '26') or (c == '22' and not skip_code22):
-            try:
-                result.append((c, f"{float(v) + oy:.10g}"))
-            except ValueError:
-                result.append((c, v))
-        else:
-            result.append((c, v))
-    return result
+        shifted += 1
+    return shifted
 
 
 def merge_dxf_files(input_files, output_path, progress_callback=None):
     """
-    Mescla múltiplos DXF exportados pelo Revit em um único arquivo.
+    Mescla múltiplos DXFs em um documento estruturalmente válido.
 
-    Cada arquivo de entrada contribui com:
-      - Suas entidades de modelspace, transladadas em X para não se sobreporem
-      - Suas entidades de paperspace (carimbo + viewports), transladadas em Y
-      - A viewport é ajustada para apontar para a posição correta no modelspace unificado
-
-    Camadas, linetypes e estilos são fundidos sem duplicação.
-    O nome do arquivo é usado como prefixo para garantir unicidade dos layouts.
+    Estratégia:
+      1. cada modelspace é importado por uma biblioteca DXF, que recria handles,
+         proprietários, tabelas, blocos e referências;
+      2. os modelos são distribuídos horizontalmente, sem sobreposição;
+      3. cada paperspace de origem vira uma aba de layout independente;
+      4. as viewports são ajustadas pelo mesmo deslocamento do modelspace;
+      5. o resultado é auditado, salvo de forma atômica e reaberto para validação.
     """
+    (
+        ezdxf,
+        bbox,
+        recover,
+        transform,
+        Importer,
+        DXFStructureError,
+        Matrix44,
+        Vec3,
+    ) = _load_ezdxf()
 
     def cb(pct, msg):
         if progress_callback:
-            progress_callback(pct, msg)
+            progress_callback(int(pct), msg)
 
-    cb(0, "Iniciando...")
+    if not input_files:
+        raise ValueError("Nenhum arquivo DXF foi informado.")
 
-    # ── 1. Carregar todos os arquivos ──────────────────────────────────────
-    parsed = []
-    for i, fpath in enumerate(input_files):
-        cb(int(i / len(input_files) * 20), f"Lendo {os.path.basename(fpath)}...")
-        pairs = parse_dxf_pairs(fpath)
-        sections = extract_sections(pairs)
-        parsed.append({
-            'path': fpath,
-            'name': Path(fpath).stem,
-            'sections': sections,
+    normalized_inputs = [os.path.abspath(os.fspath(path)) for path in input_files]
+    output_path = os.path.abspath(os.fspath(output_path))
+
+    if output_path.casefold() in {path.casefold() for path in normalized_inputs}:
+        raise ValueError("O arquivo de saída não pode substituir um dos arquivos de entrada.")
+
+    output_dir = os.path.dirname(output_path) or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    cb(0, "Verificando arquivos...")
+    loaded = []
+    recovered_count = 0
+
+    for index, path in enumerate(normalized_inputs, start=1):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+        if os.path.getsize(path) == 0:
+            raise ValueError(f"O arquivo '{os.path.basename(path)}' está vazio.")
+
+        pct = 3 + (index - 1) / len(normalized_inputs) * 22
+        cb(pct, f"Lendo {os.path.basename(path)}...")
+        doc, was_recovered, source_auditor = _read_dxf(
+            path, ezdxf, recover, DXFStructureError
+        )
+        recovered_count += int(was_recovered)
+        loaded.append({
+            "path": path,
+            "name": Path(path).stem,
+            "doc": doc,
+            "recovered": was_recovered,
+            "source_auditor": source_auditor,
+            "bbox": _model_extents(doc, bbox),
         })
 
-    # ── 2. Fundir tabelas (camadas, estilos, tipos de linha) ───────────────
-    cb(25, "Fundindo camadas e estilos...")
-    merged_layers    = {}
-    merged_ltypes    = {}
-    merged_styles    = {}
-    merged_dimstyles = {}
+    # Usar a versão DXF mais nova entre as entradas. Se houver versão não
+    # reconhecida, R2018 é a opção segura para o AutoCAD atual.
+    output_version = max(
+        (item["doc"].dxfversion for item in loaded),
+        key=lambda version: _VERSION_ORDER.get(version, _VERSION_ORDER["AC1032"]),
+    )
+    if output_version not in _VERSION_ORDER:
+        output_version = "AC1032"
 
-    for pf in parsed:
-        tables = pf['sections'].get('TABLES', [])
-        merged_layers.update(get_table_records(tables, 'LAYER'))
-        merged_ltypes.update(get_table_records(tables, 'LTYPE'))
-        merged_styles.update(get_table_records(tables, 'STYLE'))
-        merged_dimstyles.update(get_table_records(tables, 'DIMSTYLE'))
+    cb(28, "Criando o desenho de destino...")
+    target = ezdxf.new(dxfversion=output_version, setup=True)
 
-    # ── 3. Separar entidades e calcular offsets ───────────────────────────
-    cb(35, "Calculando posicionamento das pranchas...")
+    # Preservar unidades do primeiro arquivo quando definidas.
+    try:
+        target.units = loaded[0]["doc"].units
+    except Exception:
+        pass
 
-    X_GAP_MODEL  = 50.0   # gap entre modelos no modelspace unificado (metros)
-    Y_GAP_PAPER  = 20.0   # gap entre pranchas no paperspace unificado
+    # É obrigatório existir ao menos um paperspace. Mantemos um temporário
+    # até que a primeira folha seja importada.
+    temp_layout_name = "__DXF_MERGER_TEMP__"
+    if "Layout1" in target.layouts:
+        target.layouts.rename("Layout1", temp_layout_name)
 
-    file_data = []
-    x_offset = 0.0
+    target_msp = target.modelspace()
+    x_cursor = 0.0
+    imported_layouts = 0
+    imported_model_entities = 0
+    shifted_viewports = 0
+    transform_warnings = []
 
-    for pf in parsed:
-        ents = pf['sections'].get('ENTITIES', [])
-        model_ents, paper_ents = split_entities(ents)
-        model_bb = compute_bbox(model_ents)
-        paper_bb = compute_bbox(paper_ents)
-        model_width = max(model_bb[2] - model_bb[0], 1.0)
+    total = len(loaded)
+    for index, item in enumerate(loaded, start=1):
+        source = item["doc"]
+        filename = os.path.basename(item["path"])
+        cb(30 + (index - 1) / total * 52, f"Mesclando {filename}...")
 
-        file_data.append({
-            'name': pf['name'],
-            'model_ents': model_ents,
-            'paper_ents': paper_ents,
-            'model_bb':   model_bb,
-            'paper_bb':   paper_bb,
-            'x_offset':   x_offset,      # posição X no modelspace unificado
-        })
-        x_offset += model_width + X_GAP_MODEL
+        xmin, ymin, xmax, ymax = item["bbox"]
+        model_width = max(float(xmax - xmin), 1.0)
+        ox = x_cursor - float(xmin)
+        oy = 0.0
 
-    # ── 4. Construir o DXF de saída ───────────────────────────────────────
-    cb(50, "Construindo seção HEADER...")
-    out = []
+        importer = Importer(source, target)
 
-    # ─ HEADER: reutilizar do primeiro arquivo ─────────────────────────────
-    first_header = parsed[0]['sections'].get('HEADER', [])
-    out.append("  0\nSECTION\n  2\nHEADER")
-    if first_header:
-        out.append(pairs_to_text(first_header))
-    out.append("  0\nENDSEC")
+        # Importar modelspace e capturar somente as entidades recém-criadas.
+        before_count = len(target_msp)
+        importer.import_modelspace(target_layout=target_msp)
+        imported_now = list(target_msp)[before_count:]
+        imported_model_entities += len(imported_now)
 
-    # ─ TABLES ─────────────────────────────────────────────────────────────
-    cb(55, "Construindo seção TABLES...")
-    out.append("  0\nSECTION\n  2\nTABLES")
+        logger = transform.inplace(
+            imported_now,
+            Matrix44.translate(ox, oy, 0.0),
+        )
+        if len(logger):
+            transform_warnings.extend(
+                f"{filename}: {message}" for message in logger.messages()
+            )
 
-    # VPORT (mínima)
-    out.append("  0\nTABLE\n  2\nVPORT\n 70\n     0\n  0\nENDTAB")
+        source_paperspaces = [
+            layout for layout in source.layouts
+            if layout.name.casefold() != "model"
+        ]
 
-    # LTYPE
-    out.append(f"  0\nTABLE\n  2\nLTYPE\n 70\n{len(merged_ltypes):6}")
-    for pairs in merged_ltypes.values():
-        out.append(pairs_to_text(pairs))
-    out.append("  0\nENDTAB")
+        for source_layout in source_paperspaces:
+            imported_layout = importer.import_paperspace_layout(source_layout.name)
 
-    # LAYER
-    out.append(f"  0\nTABLE\n  2\nLAYER\n 70\n{len(merged_layers):6}")
-    for pairs in merged_layers.values():
-        out.append(pairs_to_text(pairs))
-    out.append("  0\nENDTAB")
-
-    # STYLE
-    out.append(f"  0\nTABLE\n  2\nSTYLE\n 70\n{len(merged_styles):6}")
-    for pairs in merged_styles.values():
-        out.append(pairs_to_text(pairs))
-    out.append("  0\nENDTAB")
-
-    # DIMSTYLE
-    out.append(f"  0\nTABLE\n  2\nDIMSTYLE\n 70\n{len(merged_dimstyles):6}")
-    for pairs in merged_dimstyles.values():
-        out.append(pairs_to_text(pairs))
-    out.append("  0\nENDTAB")
-
-    # BLOCK_RECORD: apenas os espaços principais (AutoCAD exige)
-    out.append("  0\nTABLE\n  2\nBLOCK_RECORD\n 70\n     2")
-    out.append("  0\nBLOCK_RECORD\n  5\n1\n"
-               "100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n"
-               "  2\n*Model_Space\n340\n0")
-    out.append("  0\nBLOCK_RECORD\n  5\n2\n"
-               "100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n"
-               "  2\n*Paper_Space\n340\n0")
-    out.append("  0\nENDTAB")
-
-    out.append("  0\nENDSEC")  # fim TABLES
-
-    # ─ ENTITIES ───────────────────────────────────────────────────────────
-    cb(65, "Mesclando entidades do modelspace...")
-    out.append("  0\nSECTION\n  2\nENTITIES")
-
-    # Modelspace: todas as entidades de todos os arquivos, com offset X
-    for fd in file_data:
-        ox = fd['x_offset'] - fd['model_bb'][0]  # alinhar início no x_offset
-        for ent in fd['model_ents']:
-            translated = translate_entity_x(ent, ox)
-            out.append(pairs_to_text(translated))
-
-    cb(80, "Mesclando entidades do paperspace...")
-
-    # Paperspace: empilhar verticalmente, ajustando viewports
-    paper_y_cursor = 0.0
-
-    for fd in file_data:
-        pbb = fd['paper_bb']
-        y_min = pbb[1]
-        paper_height = max(pbb[3] - pbb[1], 10.0)
-        y_shift = paper_y_cursor - y_min  # deslocar para começar em paper_y_cursor
-
-        # Offset X do modelo para este arquivo
-        model_ox = fd['x_offset'] - fd['model_bb'][0]
-
-        for ent in fd['paper_ents']:
-            entity_type = ent[0][1] if ent else ''
-
-            if entity_type == 'VIEWPORT':
-                # Viewport: transladar posição no paper (Y) e
-                # ajustar o center da view no modelspace (code 12 = X)
-                new_ent = []
-                for c, v in ent:
-                    if c == '20':  # pos Y no paperspace → deslocar
-                        try:
-                            new_ent.append((c, f"{float(v) + y_shift:.10g}"))
-                        except ValueError:
-                            new_ent.append((c, v))
-                    elif c == '12':  # view center X no modelspace → adicionar offset do modelo
-                        try:
-                            new_ent.append((c, f"{float(v) + model_ox:.10g}"))
-                        except ValueError:
-                            new_ent.append((c, v))
-                    else:
-                        new_ent.append((c, v))
-                out.append(pairs_to_text(new_ent))
+            if len(source_paperspaces) == 1:
+                desired_name = item["name"]
             else:
-                # Carimbo e outras entidades do paper: só deslocar em Y
-                translated = translate_entity_y(ent, y_shift)
-                out.append(pairs_to_text(translated))
+                desired_name = f"{item['name']} - {source_layout.name}"
 
-        paper_y_cursor += paper_height + Y_GAP_PAPER
+            final_name = _unique_layout_name(target, desired_name)
+            old_name = imported_layout.name
+            if old_name != final_name:
+                target.layouts.rename(old_name, final_name)
+            imported_layout = target.layouts.get(final_name)
 
-    out.append("  0\nENDSEC")
-    out.append("  0\nEOF")
+            shifted_viewports += _shift_layout_viewports(
+                imported_layout, ox, oy, Vec3
+            )
+            imported_layouts += 1
 
-    # ── 5. Escrever arquivo de saída ───────────────────────────────────────
-    cb(92, "Escrevendo arquivo DXF...")
-    with open(output_path, 'w', encoding='latin-1', errors='replace') as f:
-        f.write('\n'.join(out))
+        # Importa recursos dependentes: blocos, layers, linetypes, estilos e
+        # dimstyles. Também resolve nomes repetidos entre arquivos diferentes.
+        importer.finalize()
 
-    n = len(file_data)
-    cb(100, f"✓ Concluído! {n} arquivo{'s' if n > 1 else ''} mesclado{'s' if n > 1 else ''}.")
+        # Gap proporcional, com mínimo de 50 unidades do próprio desenho.
+        x_cursor += model_width + max(model_width * 0.05, 50.0)
+        cb(30 + index / total * 52, f"Concluído: {filename}")
+
+    if imported_layouts:
+        if temp_layout_name in target.layouts:
+            target.layouts.delete(temp_layout_name)
+    elif temp_layout_name in target.layouts:
+        target.layouts.rename(temp_layout_name, "Layout1")
+
+    cb(85, "Auditando a estrutura DXF...")
+    auditor = target.audit()
+    if auditor.has_errors:
+        details = "; ".join(str(error) for error in auditor.errors[:8])
+        raise RuntimeError(
+            "A auditoria encontrou erros estruturais não corrigidos no DXF final. "
+            + details
+        )
+
+    # Gravação atômica: o arquivo final só é substituído depois de concluído.
+    temp_output = output_path + ".tmp.dxf"
+    try:
+        cb(91, "Gravando arquivo temporário...")
+        target.saveas(temp_output)
+
+        cb(96, "Validando o arquivo gravado...")
+        validation_doc = ezdxf.readfile(temp_output)
+        validation_auditor = validation_doc.audit()
+        if validation_auditor.has_errors:
+            details = "; ".join(
+                str(error) for error in validation_auditor.errors[:8]
+            )
+            raise RuntimeError(
+                "O arquivo foi gravado, mas falhou na validação de releitura. "
+                + details
+            )
+
+        os.replace(temp_output, output_path)
+    finally:
+        if os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except OSError:
+                pass
+
+    cb(100, f"✓ Concluído! {total} arquivo{'s' if total != 1 else ''} mesclado{'s' if total != 1 else ''}.")
+
+    # Informações úteis no console para diagnóstico, sem interromper o usuário.
+    print(
+        "DXF Merger v1.1:",
+        f"arquivos={total},",
+        f"entidades_model={imported_model_entities},",
+        f"layouts={imported_layouts},",
+        f"viewports_ajustadas={shifted_viewports},",
+        f"fontes_recuperadas={recovered_count},",
+        f"avisos_transformacao={len(transform_warnings)}",
+    )
+    for warning in transform_warnings[:20]:
+        print("AVISO:", warning, file=sys.stderr)
+
     return True
 
 
@@ -359,7 +385,7 @@ COLORS = {
 class DXFMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("DXF Merger — Unificador de Pranchas Revit")
+        self.root.title("DXF Merger v1.1 — Unificador de Pranchas Revit")
         self.root.minsize(760, 520)
         self.root.configure(bg=COLORS['bg'])
         self.files = []   # lista de caminhos completos
@@ -400,13 +426,10 @@ class DXFMergerApp:
                     font=('Segoe UI', 9), padding=(6, 4), relief='flat')
         s.map('Small.TButton', background=[('active', COLORS['border'])])
 
-        try:
-            s.configure('TProgressbar',
-                        troughcolor=COLORS['border_light'],
-                        background=COLORS['accent'],
-                        thickness=8)
-        except Exception:
-            pass
+        s.configure('Merge.TProgressbar',
+                    troughcolor=COLORS['border_light'],
+                    background=COLORS['accent'],
+                    thickness=8)
 
     # ── Layout principal ────────────────────────────────────────────────────
 
@@ -553,7 +576,7 @@ class DXFMergerApp:
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             action, variable=self.progress_var,
-            maximum=100
+            maximum=100, style='Merge.TProgressbar'
         )
         self.progress_bar.pack(fill='x', pady=(0, 6))
 
